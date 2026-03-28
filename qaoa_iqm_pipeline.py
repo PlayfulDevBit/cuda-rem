@@ -1,7 +1,7 @@
 """
 qaoa_iqm_pipeline.py — QAOA on IQM Resonance
 ==============================================
-Stack:  CUDA-Q  |  IQM Resonance (cloud)  |  Prefect 3.x
+Stack:  Qiskit 2.1.2  |  iqm-client[qiskit] 33.0.5  |  Prefect 3.x
 Algo:   QAOA (MaxCut)
 Opt:    COBYLA (gradient-free)
 Mitig:  Readout Error Mitigation — implemented in rem.py
@@ -25,15 +25,12 @@ Prerequisites:
 
 import argparse
 import itertools
-import json
-import math
 import os
 
 import networkx as nx
 import numpy as np
 from scipy.optimize import minimize
-
-import cudaq
+from qiskit import QuantumCircuit, transpile
 
 from prefect import flow, task, get_run_logger
 from prefect.artifacts import create_markdown_artifact
@@ -55,29 +52,44 @@ def get_iqm_token() -> str:
         return os.environ.get("IQM_TOKEN", "")
 
 
-def get_iqm_server_url() -> str:
-    return os.environ.get("IQM_SERVER_URL", "https://cocos.resonance.meetiqm.com/garnet")
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# STAGE 1 — CONFIGURE IQM TARGET
-# ═══════════════════════════════════════════════════════════════════════
-
-@task(name="1 · Configure IQM Target", retries=2, retry_delay_seconds=5)
-def configure_iqm_target() -> str:
-    log = get_run_logger()
-
+def get_backend():
+    """
+    Returns IQM Resonance backend if token is available,
+    otherwise falls back to local Aer simulator.
+    """
     token = get_iqm_token()
-    server_url = get_iqm_server_url()
+    if token:
+        from iqm.qiskit_iqm import IQMProvider
+        return IQMProvider(
+            "https://cocos.resonance.meetiqm.com/garnet", token=token
+        ).get_backend()
+    else:
+        from qiskit_aer import AerSimulator
+        return AerSimulator()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# STAGE 1 — CONFIGURE BACKEND
+# ═══════════════════════════════════════════════════════════════════════
+
+@task(name="1 · Configure Backend", retries=2, retry_delay_seconds=5)
+def configure_backend():
+    log = get_run_logger()
+    token = get_iqm_token()
 
     if not token:
-        log.warning("IQM token not found — falling back to local CPU simulator (qpp-cpu).")
-        cudaq.set_target("qpp-cpu")
-        return "qpp-cpu"
+        log.warning("IQM token not found — falling back to local Aer simulator.")
+        from qiskit_aer import AerSimulator
+        backend = AerSimulator()
+        log.info("Backend: AerSimulator (local)")
+    else:
+        from iqm.qiskit_iqm import IQMProvider
+        backend = IQMProvider(
+            "https://cocos.resonance.meetiqm.com/garnet", token=token
+        ).get_backend()
+        log.info(f"Backend: IQM Resonance — {backend.name}")
 
-    cudaq.set_target("iqm", url=server_url, **{"credentials": token})
-    log.info(f"CUDA-Q target set → IQM Resonance  |  {server_url}")
-    return "iqm"
+    return backend
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -88,7 +100,7 @@ def configure_iqm_target() -> str:
 def build_problem_graph(n_qubits: int, seed: int) -> dict:
     """
     Build a random weighted MaxCut graph.
-    Swap this task for your own problem Hamiltonian if needed.
+    Swap this task for your own problem if needed.
     """
     log = get_run_logger()
     rng = np.random.default_rng(seed)
@@ -115,29 +127,43 @@ def build_problem_graph(n_qubits: int, seed: int) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# STAGE 3 — BUILD COST HAMILTONIAN
+# STAGE 3 — BUILD QAOA CIRCUIT
 # ═══════════════════════════════════════════════════════════════════════
 
-@task(name="3 · Build Cost Hamiltonian")
-def build_cost_hamiltonian(graph: dict):
+@task(name="3 · Build QAOA Circuit")
+def build_qaoa_circuit(graph: dict, p: int) -> QuantumCircuit:
+    """
+    Build the parameterised QAOA circuit (p layers).
+    Parameters layout: [gamma_0, ..., gamma_{p-1}, beta_0, ..., beta_{p-1}]
+    Returns a plain Qiskit QuantumCircuit with bound parameters for each call.
+    """
     log = get_run_logger()
     n = graph["n_qubits"]
+    edges = graph["edges"]
 
-    H = cudaq.SpinOperator.from_word("I" * n) * 0.0
-    for u, v, w in graph["edges"]:
-        H += w * 0.5 * (
-            cudaq.SpinOperator.from_word("I" * n) - _zz_term(n, u, v)
-        )
+    from qiskit.circuit import ParameterVector
+    gammas = ParameterVector("gamma", p)
+    betas  = ParameterVector("beta",  p)
 
-    log.info(f"Hamiltonian built — {H.get_term_count()} terms")
-    return H
+    qc = QuantumCircuit(n)
 
+    # |+>^n initial state
+    qc.h(range(n))
 
-def _zz_term(n: int, i: int, j: int):
-    word = ["I"] * n
-    word[i] = "Z"
-    word[j] = "Z"
-    return cudaq.SpinOperator.from_word("".join(word))
+    for layer in range(p):
+        # Cost unitary
+        for u, v, w in edges:
+            qc.cx(u, v)
+            qc.rz(2.0 * gammas[layer] * w, v)
+            qc.cx(u, v)
+        # Mixer unitary
+        for i in range(n):
+            qc.rx(2.0 * betas[layer], i)
+
+    qc.measure_all()
+
+    log.info(f"QAOA circuit: {qc.num_qubits} qubits, depth {qc.depth()}, {p} layers")
+    return qc
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -145,54 +171,23 @@ def _zz_term(n: int, i: int, j: int):
 # ═══════════════════════════════════════════════════════════════════════
 
 @task(name="4 · Calibrate Readout", retries=3, retry_delay_seconds=10)
-def calibrate_readout(n_qubits: int, shots: int):
+def calibrate_readout(backend, n_qubits: int, shots: int):
     log = get_run_logger()
     log.info("Running readout calibration via rem.calibrate()…")
-    cal = rem_calibrate(n_qubits=n_qubits, shots=shots)
+    cal = rem_calibrate(backend=backend, n_qubits=n_qubits, shots=shots)
     log.info("Calibration complete.")
     return cal
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# STAGE 5 — QAOA CIRCUIT KERNEL
+# STAGE 5 — COBYLA OPTIMISATION  (calls rem.apply each iteration)
 # ═══════════════════════════════════════════════════════════════════════
 
-def make_qaoa_kernel(n_qubits: int, p: int, edges: list):
-    """
-    Factory: returns a CUDA-Q kernel for QAOA with p layers.
-    Parameters layout: [gamma_0, ..., gamma_{p-1}, beta_0, ..., beta_{p-1}]
-    """
-    @cudaq.kernel
-    def qaoa(params: list[float]):
-        q = cudaq.qvector(n_qubits)
-
-        # |+>^n initial state
-        h(q)
-
-        for layer in range(p):
-            gamma = params[layer]
-            beta  = params[p + layer]
-
-            # Cost unitary: exp(-i gamma H_C)
-            for u, v, w in edges:
-                x.ctrl(q[u], q[v])
-                rz(2.0 * gamma * w, q[v])
-                x.ctrl(q[u], q[v])
-
-            # Mixer unitary: exp(-i beta B)
-            for i in range(n_qubits):
-                rx(2.0 * beta, q[i])
-
-    return qaoa
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# STAGE 6 — COBYLA OPTIMISATION  (calls rem.apply each iteration)
-# ═══════════════════════════════════════════════════════════════════════
-
-@task(name="6 · COBYLA Optimisation", retries=1, retry_delay_seconds=30)
+@task(name="5 · COBYLA Optimisation", retries=1, retry_delay_seconds=30)
 def run_cobyla_optimization(
     graph: dict,
+    qc_template: QuantumCircuit,
+    backend,
     cal,
     p: int,
     shots: int,
@@ -201,29 +196,40 @@ def run_cobyla_optimization(
 ) -> dict:
     """
     COBYLA outer loop. Each objective evaluation:
-      1. Runs QAOA circuit on IQM Resonance via CUDA-Q
+      1. Binds parameters and runs QAOA circuit on the backend
       2. Applies REM to raw counts  (via rem.apply)
       3. Estimates <H_C> from corrected probabilities
     """
     log = get_run_logger()
     n = graph["n_qubits"]
     edges = graph["edges"]
-    kernel = make_qaoa_kernel(n, p, edges)
     energy_history = []
 
     def objective(params: np.ndarray) -> float:
-        raw = cudaq.sample(kernel, params.tolist(), shots_count=shots)
-        raw_dict = {bs: cnt for bs, cnt in raw.items()}
+        gammas = params[:p]
+        betas  = params[p:]
+
+        # Bind parameters
+        param_dict = {}
+        for i, g in enumerate(gammas):
+            param_dict[f"gamma[{i}]"] = float(g)
+        for i, b in enumerate(betas):
+            param_dict[f"beta[{i}]"] = float(b)
+
+        bound_qc = qc_template.assign_parameters(param_dict)
+        bound_qc_t = transpile(bound_qc, backend=backend, optimization_level=2)
+
+        raw = backend.run(bound_qc_t, shots=shots).result().get_counts()
 
         # REM correction (from rem.py)
         corrected = rem_apply(
-            raw_counts=raw_dict, calibration=cal, n_qubits=n, shots=shots
+            raw_counts=raw, calibration=cal, n_qubits=n, shots=shots
         )
 
         cost = _estimate_maxcut_cost(corrected, edges)
         energy_history.append(float(cost))
         log.debug(f"  iter {len(energy_history):3d}  cost={cost:.5f}")
-        return cost  # COBYLA minimises — MaxCut negated inside _estimate_maxcut_cost
+        return cost  # COBYLA minimises — MaxCut negated inside helper
 
     rng = np.random.default_rng(42)
     x0 = rng.uniform(-0.1, 0.1, size=2 * p)
@@ -255,13 +261,15 @@ def _estimate_maxcut_cost(probs: dict, edges: list) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# STAGE 7 — POST-PROCESSING
+# STAGE 6 — POST-PROCESSING
 # ═══════════════════════════════════════════════════════════════════════
 
-@task(name="7 · Post-Process Results")
+@task(name="6 · Post-Process Results")
 def post_process_results(
     graph: dict,
+    qc_template: QuantumCircuit,
     opt_result: dict,
+    backend,
     cal,
     shots: int,
     p: int,
@@ -269,13 +277,25 @@ def post_process_results(
     log = get_run_logger()
     n = graph["n_qubits"]
     edges = graph["edges"]
-    kernel = make_qaoa_kernel(n, p, edges)
 
     log.info("Final high-shot execution at optimal parameters…")
-    raw = cudaq.sample(kernel, opt_result["optimal_params"], shots_count=shots * 2)
-    raw_dict = {bs: cnt for bs, cnt in raw.items()}
+
+    params = opt_result["optimal_params"]
+    gammas = params[:p]
+    betas  = params[p:]
+
+    param_dict = {}
+    for i, g in enumerate(gammas):
+        param_dict[f"gamma[{i}]"] = float(g)
+    for i, b in enumerate(betas):
+        param_dict[f"beta[{i}]"] = float(b)
+
+    bound_qc = qc_template.assign_parameters(param_dict)
+    bound_qc_t = transpile(bound_qc, backend=backend, optimization_level=2)
+
+    raw = backend.run(bound_qc_t, shots=shots * 2).result().get_counts()
     corrected = rem_apply(
-        raw_counts=raw_dict, calibration=cal, n_qubits=n, shots=shots * 2
+        raw_counts=raw, calibration=cal, n_qubits=n, shots=shots * 2
     )
 
     best_bs = max(corrected, key=corrected.get)
@@ -344,7 +364,7 @@ def _brute_force_maxcut(n: int, edges: list) -> tuple:
 @flow(
     name="qaoa-iqm-resonance",
     description=(
-        "QAOA on IQM Resonance — COBYLA optimisation + "
+        "QAOA on IQM Resonance — Qiskit + COBYLA + "
         "Readout Error Mitigation (pluggable via rem.py)"
     ),
     log_prints=True,
@@ -360,13 +380,12 @@ def qaoa_iqm_flow(
 ):
     """
     QAOA pipeline stages:
-      1. Configure IQM Resonance target (or local simulator if no token)
+      1. Configure backend (IQM Resonance or local Aer simulator)
       2. Build MaxCut problem graph
-      3. Build cost Hamiltonian
+      3. Build parameterised QAOA circuit
       4. Calibrate readout noise          ← rem.calibrate()
-      5. Build QAOA kernel                ← CUDA-Q
-      6. COBYLA optimisation loop         ← rem.apply() every iteration
-      7. Post-process and report results
+      5. COBYLA optimisation loop         ← rem.apply() every iteration
+      6. Post-process and report results
     """
     print(f"\n{'━' * 60}")
     print(f"  QAOA · IQM Resonance")
@@ -375,26 +394,23 @@ def qaoa_iqm_flow(
     print(f"  REM calibration shots: {rem_shots}  |  Seed: {seed}")
     print(f"{'━' * 60}\n")
 
-    # Stage 1
-    print("▸ STAGE 1: Configure IQM Target")
-    configure_iqm_target()
+    print("▸ STAGE 1: Configure Backend")
+    backend = configure_backend()
 
-    # Stage 2
     print("\n▸ STAGE 2: Build Problem Graph")
     graph = build_problem_graph(n_qubits, seed)
 
-    # Stage 3
-    print("\n▸ STAGE 3: Build Cost Hamiltonian")
-    hamiltonian = build_cost_hamiltonian(graph)
+    print("\n▸ STAGE 3: Build QAOA Circuit")
+    qc_template = build_qaoa_circuit(graph, p_layers)
 
-    # Stage 4
     print("\n▸ STAGE 4: Calibrate Readout (rem.calibrate)")
-    cal = calibrate_readout(n_qubits, rem_shots)
+    cal = calibrate_readout(backend, n_qubits, rem_shots)
 
-    # Stage 5 + 6
-    print("\n▸ STAGE 5+6: QAOA Circuit + COBYLA Optimisation")
+    print("\n▸ STAGE 5: COBYLA Optimisation")
     opt_result = run_cobyla_optimization(
         graph=graph,
+        qc_template=qc_template,
+        backend=backend,
         cal=cal,
         p=p_layers,
         shots=shots,
@@ -402,11 +418,12 @@ def qaoa_iqm_flow(
         rhobeg=cobyla_rhobeg,
     )
 
-    # Stage 7
-    print("\n▸ STAGE 7: Post-Process Results")
+    print("\n▸ STAGE 6: Post-Process Results")
     final = post_process_results(
         graph=graph,
+        qc_template=qc_template,
         opt_result=opt_result,
+        backend=backend,
         cal=cal,
         shots=shots,
         p=p_layers,
@@ -431,14 +448,14 @@ def qaoa_iqm_flow(
 # ═══════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="QAOA on IQM Resonance · CUDA-Q · Prefect")
-    parser.add_argument("--n_qubits",       type=int,   default=4)
-    parser.add_argument("--p_layers",       type=int,   default=2)
-    parser.add_argument("--shots",          type=int,   default=4096)
-    parser.add_argument("--cobyla_max_iter",type=int,   default=150)
-    parser.add_argument("--cobyla_rhobeg",  type=float, default=0.5)
-    parser.add_argument("--rem_shots",      type=int,   default=1024)
-    parser.add_argument("--seed",           type=int,   default=42)
+    parser = argparse.ArgumentParser(description="QAOA on IQM Resonance · Qiskit · Prefect")
+    parser.add_argument("--n_qubits",        type=int,   default=4)
+    parser.add_argument("--p_layers",        type=int,   default=2)
+    parser.add_argument("--shots",           type=int,   default=4096)
+    parser.add_argument("--cobyla_max_iter", type=int,   default=150)
+    parser.add_argument("--cobyla_rhobeg",   type=float, default=0.5)
+    parser.add_argument("--rem_shots",       type=int,   default=1024)
+    parser.add_argument("--seed",            type=int,   default=42)
     args = parser.parse_args()
 
     qaoa_iqm_flow(

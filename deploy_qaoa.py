@@ -22,8 +22,14 @@ Usage:
 import sys
 import unittest.mock
 
-# cudaq is Linux-only — mock it so this deploy script can run on Windows
-sys.modules.setdefault("cudaq", unittest.mock.MagicMock())
+# Qiskit IQM provider is Linux-only — mock it so this deploy script
+# can run on Windows without installing the full quantum stack
+for mod in [
+    "qiskit_aer",
+    "iqm",
+    "iqm.qiskit_iqm",
+]:
+    sys.modules.setdefault(mod, unittest.mock.MagicMock())
 
 from prefect.runner.storage import GitRepository
 from qaoa_iqm_pipeline import qaoa_iqm_flow
@@ -47,11 +53,11 @@ if __name__ == "__main__":
         work_pool_name=WORK_POOL_NAME,
         version="1.0.0",
         description=(
-            "QAOA on IQM Resonance via CUDA-Q. "
+            "QAOA on IQM Resonance via Qiskit. "
             "COBYLA optimisation with pluggable Readout Error Mitigation (rem.py). "
             "Produces cost history and results artifacts."
         ),
-        tags=["quantum", "qaoa", "cuda-q", "iqm-resonance", "rem", "cobyla"],
+        tags=["quantum", "qaoa", "qiskit", "iqm-resonance", "rem", "cobyla"],
 
         # ── Default Parameters (all overridable from Prefect Cloud UI) ──
         parameters={
@@ -64,10 +70,12 @@ if __name__ == "__main__":
             "seed":            42,
         },
 
-        # ── Dependencies ────────────────────────────────────────────────
+        # ── Dependencies — pinned to match working Grover pipeline ──────
         job_variables={
             "pip_packages": [
-                "cudaq",
+                "qiskit==2.1.2",
+                "iqm-client[qiskit]==33.0.5",
+                "qiskit-aer",
                 "prefect>=3.0",
                 "scipy",
                 "numpy>=1.24",
