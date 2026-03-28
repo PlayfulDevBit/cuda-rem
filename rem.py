@@ -31,10 +31,8 @@ DEVELOPING IN JUPYTER:
 
 import numpy as np
 from scipy.optimize import lsq_linear
-try:
-    import cudaq
-except ImportError:
-    cudaq = None  # not available on Windows — runs on the Prefect worker
+
+import cudaq
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -19,6 +19,12 @@ Usage:
     python deploy_qaoa.py
 """
 
+import sys
+import unittest.mock
+
+# cudaq is Linux-only — mock it so this deploy script can run on Windows
+sys.modules.setdefault("cudaq", unittest.mock.MagicMock())
+
 from prefect.runner.storage import GitRepository
 from qaoa_iqm_pipeline import qaoa_iqm_flow
 
@@ -62,6 +68,7 @@ if __name__ == "__main__":
         job_variables={
             "pip_packages": [
                 "cudaq",
+                "cudaq-iqm",
                 "prefect>=3.0",
                 "scipy",
                 "numpy>=1.24",
