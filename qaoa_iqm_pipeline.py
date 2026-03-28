@@ -136,7 +136,7 @@ def build_cost_hamiltonian(graph: dict):
     return H
 
 
-def _zz_term(n: int, i: int, j: int) -> cudaq.SpinOperator:
+def _zz_term(n: int, i: int, j: int):
     word = ["I"] * n
     word[i] = "Z"
     word[j] = "Z"
