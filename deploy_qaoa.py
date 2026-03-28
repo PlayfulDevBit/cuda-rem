@@ -61,7 +61,7 @@ if __name__ == "__main__":
         # ── Dependencies ────────────────────────────────────────────────
         job_variables={
             "pip_packages": [
-                "cuda-quantum",
+                "cudaq",
                 "prefect>=3.0",
                 "scipy",
                 "numpy>=1.24",
