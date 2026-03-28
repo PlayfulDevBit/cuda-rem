@@ -33,7 +33,10 @@ import networkx as nx
 import numpy as np
 from scipy.optimize import minimize
 
-import cudaq
+try:
+    import cudaq
+except ImportError:
+    cudaq = None  # not available on Windows — runs on the Prefect worker
 from prefect import flow, task, get_run_logger
 from prefect.artifacts import create_markdown_artifact
 
