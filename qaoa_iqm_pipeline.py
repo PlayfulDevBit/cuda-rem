@@ -37,6 +37,7 @@ try:
     import cudaq
 except ImportError:
     cudaq = None  # not available on Windows — runs on the Prefect worker
+
 from prefect import flow, task, get_run_logger
 from prefect.artifacts import create_markdown_artifact
 
@@ -121,7 +122,7 @@ def build_problem_graph(n_qubits: int, seed: int) -> dict:
 # ═══════════════════════════════════════════════════════════════════════
 
 @task(name="3 · Build Cost Hamiltonian")
-def build_cost_hamiltonian(graph: dict) -> cudaq.SpinOperator:
+def build_cost_hamiltonian(graph: dict):
     log = get_run_logger()
     n = graph["n_qubits"]
 
