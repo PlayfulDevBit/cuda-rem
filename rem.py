@@ -11,16 +11,22 @@ The rest of the pipeline (qaoa_iqm_pipeline.py) imports these two functions
 and calls them automatically. You never need to touch the pipeline file.
 
 CONTRACT (do not change function names or argument names):
-    calibrate(n_qubits, shots)          → CalibrationData (any object you choose)
-    apply(raw_counts, calibration, n_qubits, shots) → dict[str, float]
+    calibrate(n_qubits, shots)                              → any object you choose
+    apply(raw_counts, calibration, n_qubits, shots)         → dict[str, float]
 
 The return of apply() must be a dict mapping bitstrings to corrected probabilities.
 Example: {"00": 0.12, "01": 0.43, "10": 0.31, "11": 0.14}
 
 DEVELOPING IN JUPYTER:
+    import cudaq
+    import os
+    os.environ["CUDAQ_TARGET"] = "qpp-cpu"   # local simulator — no hardware needed
+    cudaq.set_target("qpp-cpu")
+
     from rem import calibrate, apply
     cal = calibrate(n_qubits=2, shots=1024)
-    corrected = apply(raw_counts={"00": 600, "01": 400}, calibration=cal, n_qubits=2, shots=1024)
+    corrected = apply(raw_counts={"00": 600, "01": 400}, calibration=cal, n_qubits=2, shots=1000)
+    print(corrected)
 """
 
 import numpy as np
@@ -49,9 +55,9 @@ def calibrate(n_qubits: int, shots: int) -> np.ndarray:
 
     RETURNS:
         np.ndarray of shape (2^n_qubits, 2^n_qubits)
-        (or replace with any structure your apply() expects)
+        (replace with any structure your apply() expects)
 
-    ── EDIT BELOW THIS LINE ──────────────────────────────────────────────────
+    ── EDIT BELOW THIS LINE ─────────────────────────────────────────────────
     """
     dim = 2 ** n_qubits
     A = np.zeros((dim, dim))
@@ -105,7 +111,7 @@ def apply(
         dict mapping bitstrings to corrected float probabilities
         e.g. {"00": 0.63, "01": 0.37, "10": 0.0, "11": 0.0}
 
-    ── EDIT BELOW THIS LINE ──────────────────────────────────────────────────
+    ── EDIT BELOW THIS LINE ─────────────────────────────────────────────────
     """
     dim = 2 ** n_qubits
     A = calibration
